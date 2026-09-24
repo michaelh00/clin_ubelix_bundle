@@ -35,7 +35,7 @@ Everything lives in one project folder (`$HOME/CLIN` below; any path works, incl
 
 **Step 1 – Log in**
 ```bash
-ssh <campus_account>@submit.unibe.ch
+ssh <campus_account>@submit01.unibe.ch
 ```
 
 **Step 2 – Upload the scripts** (manually, e.g. WinSCP/scp) into `~/CLIN/code/`: all files listed in §4. Then:
