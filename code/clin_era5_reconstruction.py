@@ -575,21 +575,26 @@ class ERA5FieldDataset(Dataset):
 
 def maybe_resume(model, optimizer, accelerator):
     """Returns (global_step, best_loss) restored from the most recent
-    checkpoint, or (0, inf) if there is none."""
-    files = sorted(glob(str(MODEL_DIR / f"{MODEL_PREFIX}_*.pt")), key=os.path.getmtime)
-    if not files:
-        logger.info("No checkpoint found, training from scratch.")
-        return 0, float("inf")
-    path = files[-1]
-    ckpt = torch.load(path, map_location=accelerator.device, weights_only=True)
-    state = ckpt["model"]
-    state = {(k[7:] if k.startswith("module.") else k): v for k, v in state.items()}
-    accelerator.unwrap_model(model).load_state_dict(state)
-    optimizer.load_state_dict(ckpt["optimizer"])
-    global_step = ckpt.get("global_step", 0)
-    best_loss = ckpt.get("best_loss", float("inf"))
-    logger.info(f"Resumed from {path} (step {global_step}, best_val {best_loss:.4f})")
-    return global_step, best_loss
+    checkpoint, or (0, inf) if there is none. Tries checkpoints newest-first
+    and skips any that fail to load (e.g. left truncated by a job killed
+    mid-write), so a single corrupted file cannot silently reset training
+    to scratch or crash the run."""
+    files = sorted(glob(str(MODEL_DIR / f"{MODEL_PREFIX}_*.pt")), key=os.path.getmtime, reverse=True)
+    for path in files:
+        try:
+            ckpt = torch.load(path, map_location=accelerator.device, weights_only=True)
+            state = ckpt["model"]
+            state = {(k[7:] if k.startswith("module.") else k): v for k, v in state.items()}
+            accelerator.unwrap_model(model).load_state_dict(state)
+            optimizer.load_state_dict(ckpt["optimizer"])
+            global_step = ckpt.get("global_step", 0)
+            best_loss = ckpt.get("best_loss", float("inf"))
+            logger.info(f"Resumed from {path} (step {global_step}, best_val {best_loss:.4f})")
+            return global_step, best_loss
+        except Exception as e:
+            logger.warning(f"Could not load checkpoint {path} ({e}); trying an older one.")
+    logger.info("No usable checkpoint found, training from scratch.")
+    return 0, float("inf")
 
 
 def prune_checkpoints():
@@ -607,8 +612,10 @@ def save_checkpoint(model, optimizer, global_step, loss_running, tag="", best_lo
     ts = time.strftime("%Y%m%d%H%M")
     loss_str = f"{loss_running:.4f}".replace(".", "")
     path = MODEL_DIR / f"{MODEL_PREFIX}_{ts}{suffix}_{loss_str}.pt"
+    tmp_path = path.with_suffix(".pt.tmp")
     torch.save({"model": model.state_dict(), "optimizer": optimizer.state_dict(),
-                "global_step": global_step, "best_loss": best_loss}, path)
+                "global_step": global_step, "best_loss": best_loss}, tmp_path)
+    tmp_path.rename(path)  # atomic: a killed job can never leave a half-written .pt file
     logger.info(f"Saved checkpoint: {path.name}")
     if tag == "best":
         # keep only the newest best checkpoint
@@ -686,7 +693,18 @@ def train():
     global_step, best_loss = maybe_resume(model, optimizer, accelerator)
     t_start = time.time()
 
-    for epoch in range(1, EPOCHS + 1):
+    # Resume at the correct EPOCH, not epoch 1: steps_per_epoch is fixed (drop_last=True),
+    # so global_step tells us exactly how many full epochs are already done. Without this,
+    # every resumed job would silently restart the full EPOCHS-epoch target from scratch
+    # (same weights, but training would never actually finish).
+    steps_per_epoch = len(train_loader)
+    start_epoch = global_step // steps_per_epoch + 1
+    if start_epoch > EPOCHS:
+        logger.info(f"Training already complete: global_step={global_step} >= "
+                     f"{EPOCHS} epochs x {steps_per_epoch} steps/epoch. Nothing to do.")
+        return
+
+    for epoch in range(start_epoch, EPOCHS + 1):
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}", leave=False)
         loss_running, n_seen = 0.0, 0
         for batch in pbar:
@@ -725,6 +743,8 @@ def train():
                         save_checkpoint(accelerator.unwrap_model(model), optimizer, global_step, val_loss,
                                         best_loss=best_loss)
                     prune_checkpoints()
+                gc.collect()
+                torch.cuda.empty_cache()  # avoid fragmented memory right after eval + checkpoint save
 
         logger.info(f"Epoch {epoch} done  train_running={loss_running:.4f}  best_val={best_loss:.4f}  "
                     f"elapsed={(time.time()-t_start)/60:.1f}min")

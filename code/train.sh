@@ -5,11 +5,12 @@
 #SBATCH --job-name=clin-train
 #SBATCH --nodes=1
 #SBATCH --account=gratis
-#SBATCH --partition=gpu
-#SBATCH --gres=gpu:rtx4090:1
+#SBATCH --partition=gpu-invest
+#SBATCH --gres=gpu:h100:1
+#SBATCH --qos=job_gpu_preemptable
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=24G
-#SBATCH --time=96:00:00
+#SBATCH --time=24:00:00
 #SBATCH --output=logs/%x_%j.out
 #SBATCH --mail-type=END,FAIL
 
