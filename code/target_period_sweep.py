@@ -202,7 +202,12 @@ def plot_error_across_period(df, value_col="rmse_degC", out_path="reconstruction
 if __name__ == "__main__":
     # Sanity-check pass first: a handful of days, small batch, reduced
     # sampling steps -- confirms the pipeline runs end to end cheaply.
-    df_smoke = run_target_period_sweep(max_days=8, batch_size=4, n_steps=50)
+    # UBELIX NOTE: 1667-1746 has only 1-10 stations/day (see decade density
+    # check), so a smoke test there barely exercises the mask fix. Pinning
+    # to a dense decade (1767 onward: every day has >=10 stations, growing
+    # into the hundreds by the 1900s) gives a more representative sanity
+    # check of the hist_obs_metadata.csv column-order fix.
+    df_smoke = run_target_period_sweep(target_year_range=(1800, 1809), max_days=8, batch_size=4, n_steps=50)
     print(df_smoke)
 
     # Full run (uncomment once the smoke test above looks right):

@@ -59,8 +59,9 @@ section below) and follow exactly the formats confirmed in discussion:
       (missing = NaN)
 
   hist_obs_metadata.csv
-      no header, columns: id, lat, lon (lat/lon pre-rounded to nearest
-      ERA5 grid coordinate)
+      no header, columns AS ACTUALLY STORED: id, lon, lat (confirmed on
+      UBELIX data -- NOT id, lat, lon as originally documented; see UBELIX
+      PATCH 4 below). lat/lon pre-rounded to nearest ERA5 grid coordinate.
 
 Edit the CONFIG section (paths, split years, hyperparameters, SLURM/GPU
 particulars are handled at the job-submission level, not in this script)
@@ -77,6 +78,18 @@ UBELIX PATCHES (compared with the original version):
   3. Checkpointing: best validation loss is stored in every checkpoint and
      restored on resume; only the newest "best" checkpoint is kept; the
      regular-checkpoint pruning never deletes the best checkpoint.
+  4. load_historical_obs() reads hist_obs_metadata.csv columns as
+     (id, lon, lat), not (id, lat, lon). With the documented order, all 634
+     stations decoded to physically-impossible or out-of-domain
+     coordinates and every mask collapsed onto a single grid cell in the
+     corner of the domain -- confirmed by checking each station's
+     coordinates against the ERA5 domain bounds both ways (0/634 valid as
+     documented, 634/634 valid swapped). A range check was added so this
+     class of error raises immediately instead of silently producing
+     garbage reconstructions. NOTE: this bug only affects
+     target_period_sweep.py and example_usage.py (station coordinates are
+     never used during training), so a completed training run is NOT
+     affected and does not need to be redone.
 """
 
 import argparse
@@ -476,14 +489,30 @@ def load_historical_obs(data_dir):
         day_index = np.asarray(ds.variables["day_index"][:], dtype=np.int64)
         values = _read_var(ds, "hist_obs", ("day_index", "id"))
         nc_ids = np.asarray(ds.variables["id"][:]) if "id" in ds.variables else None
+    # UBELIX PATCH: the actual file has columns (id, lon, lat), not the
+    # documented (id, lat, lon) -- confirmed by every one of 634 stations
+    # landing outside the ERA5 domain (34.5-66.25N x 12.25W-35.5E) when read
+    # as (lat, lon), and all 634 landing inside it when read as (lon, lat).
     meta = pd.read_csv(data_dir / "hist_obs_metadata.csv", header=None,
-                        names=["id", "lat", "lon"])
+                        names=["id", "lon", "lat"])
     if values.shape[1] != len(meta):
         raise ValueError(f"hist_obs has {values.shape[1]} stations but metadata lists {len(meta)}")
     if nc_ids is not None and not np.array_equal(nc_ids.astype(np.int64), meta["id"].to_numpy().astype(np.int64)):
         logger.warning("station ids in hist_obs.nc differ from hist_obs_metadata.csv (order/values) -- "
                        "check that columns of hist_obs correspond to the metadata rows")
-    return day_index, values, meta["id"].to_numpy(), meta["lat"].to_numpy(), meta["lon"].to_numpy()
+    station_lat = meta["lat"].to_numpy()
+    station_lon = meta["lon"].to_numpy()
+    # Sanity check: catches this exact class of bug (swapped/misread columns)
+    # instead of silently collapsing every station onto one grid cell.
+    lat_lo, lat_hi = -90.0, 90.0
+    lon_lo, lon_hi = -180.0, 180.0
+    out_of_range = ((station_lat < lat_lo) | (station_lat > lat_hi) |
+                     (station_lon < lon_lo) | (station_lon > lon_hi))
+    if out_of_range.any():
+        raise ValueError(
+            f"{out_of_range.sum()} station(s) in hist_obs_metadata.csv have lat/lon outside "
+            f"physically valid ranges -- the column order is likely wrong (check id/lat/lon order).")
+    return day_index, values, meta["id"].to_numpy(), station_lat, station_lon
 
 
 def station_to_grid_indices(station_lat, station_lon, era5_lat, era5_lon, tol=1e-3):
