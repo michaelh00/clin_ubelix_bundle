@@ -1,6 +1,6 @@
 # CLIN on UBELIX – Project Status
 
-**Last updated:** 2026-09-29
+**Last updated:** 2026-10-02
 
 This file tracks _where the project actually is_ — what's done, what broke and how it was fixed, and what's next. It complements `README_reproduction_guide.md`, which is the step-by-step setup guide (currently a bit behind — see "Known gaps in the setup guide" at the bottom). Append new dated sections as the project progresses; don't rewrite history above.
 
@@ -19,7 +19,7 @@ This file tracks _where the project actually is_ — what's done, what broke and
 | --------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
 | 1. Train from scratch             | **Done.** One full training run completed on UBELIX (see §4).                                                         |
 | 2. Hyperparameter tuning          | **Not started.** Needs a tuning plan (config grid, short-run budget) — see §6.                                        |
-| 3. Test-set evaluation sweep      | **In progress.** Pipeline verified end-to-end (bug fixed, smoke-tested); full sweep over 1667–1939 launched (see §5). |
+| 3. Test-set evaluation sweep      | **Done.** Full sweep over 1667–1939 (99,710 days) completed and merged; see §5 for results. |
 | 4. Real historical reconstruction | **Not started.** Script doesn't exist yet; needs a few design decisions (see §6).                                     |
 
 ## 3. Environment & setup — what had to change vs. the original scripts
@@ -87,17 +87,43 @@ Ran clean, no warnings, no crashes:
 
 Most days: 3–5°C RMSE, a plausible range for winter-field reconstruction at this station density. Note the real full sweep uses `SAMPLING_STEPS = 1000` (not 50) per the module default, so per-day cost there is ~20x this smoke test.
 
-### Full sweep — status
+### Getting the full sweep running (resource-budget fix)
 
-Launched via `sbatch sweep_array.sh` (job array, 20 chunks, 4 concurrent). First task ran fine; the array's default `--mem=32G --time=24:00:00` request turned out to be far more than needed and tripped `MaxMemoryRunMinsPerUser` (a memory×walltime budget cap) when 4 tasks tried to run at once under `gratis`. **Next step: get real per-batch timing from a running chunk and right-size `--mem`/`--time` in `sweep_array.sh`** so all 4 concurrent tasks fit under the cap. Not yet resolved as of this writing.
+First launch via `sbatch sweep_array.sh` (job array, 20 chunks, 4 concurrent) only got 1 of 4 concurrent tasks running — the array's original `--mem=32G --time=24:00:00` request tripped `MaxMemoryRunMinsPerUser` (a memory×walltime budget cap under `gratis`) once 4 tasks tried to run at once. Timed one real chunk (192 days done in 17 min, including ~30–40s fixed data-loading overhead) → ~5s/day → **~7–8 h for one chunk's full 4,986-day share**. Right-sized the request to `--mem=8G --time=10:00:00`, which also surfaced a second, separate cap: `gratis` only allows 2 concurrent `rtx4090` per user (`sqos gpu`), so `--array=0-19%4` was changed to `%2`. Both fixes are now in `sweep_array.sh`.
+
+### Full sweep — results
+
+Completed: 20/20 chunks, **99,710 days total**, merged via `merge_sweep.py` into `target_period_reconstruction_results.csv` + `reconstruction_error_vs_target_period.png`. Total wall time ~70–80 h (2 concurrent chunks × ~7–8 h/chunk × 10 chunk-pairs).
+
+| | RMSE °C | MAE °C |
+|---|---|---|
+| Overall mean (n=99,710) | 3.93 | 2.99 |
+| Overall std | 1.49 | 1.13 |
+| Median | 3.58 | 2.72 |
+| Max | 14.35 | 11.52 |
+
+By era (mean):
+
+| Era | RMSE °C | MAE °C | Mean n_obs |
+|---|---|---|---|
+| 1667–1746 (sparse) | 3.99 | 3.04 | 3.2 |
+| 1747–1766 (growing) | 3.98 | 3.03 | 12.8 |
+| 1767–1846 (dense) | 3.96 | 3.01 | 29.6 |
+| 1847–1939 (very dense) | 3.83 | 2.91 | 171.5 |
+
+**Headline finding — error is only weakly sensitive to station density.** A ~50× increase in stations/day (1667–1746 → 1847–1939) buys only a ~4% RMSE reduction. The plot shows a gentle, roughly linear drift from ~4.1°C (1667) down to ~3.6°C (1939) yearly-mean RMSE, with no visible kink around 1747–1767 where density actually jumps sharply — if the model were strongly using nearby stations, a bigger accuracy gain there would be expected.
+
+Two explanations we haven't distinguished yet, worth discussing with the original author:
+1. The model may lean mainly on its learned unconditional prior (typical field shape for a given day-of-year) rather than strongly propagating information outward from the sparse "known" cells to nearby unmasked cells.
+2. Averaging error over *every* unobserved cell — including ones far from any station even at high density, given a 128×192 grid — may be washing out a real but spatially localized improvement near stations.
+
+**Proposed follow-up (not yet done):** stratify reconstruction error by distance-to-nearest-station rather than just era/station-count, to tell (1) apart from (2). The per-day station lat/lon used by the sweep would need to be carried through into the per-cell error, not just aggregated to a day-level `n_obs`.
 
 ## 6. Open items / next steps
 
-- Finish getting the full sweep running at full concurrency (§5).
-- Once the sweep completes: `python merge_sweep.py` → `target_period_reconstruction_results.csv` + error-vs-year plot; review with the coworker, especially the pre-1750 sparse-network years.
+- **Distance-to-nearest-station stratification** of the sweep results (see above) — the clearest next step to understand the density-dependence finding, before concluding anything stronger about model quality.
 - **Hyperparameter tuning (plan step 2):** not started. Given the val-loss plateau at ~30% of training (§4), short runs (e.g. 10–20% of full length) may be enough to rank configs — worth discussing with the original author before committing to a tuning budget. Needs: a config table, per-run output folders, a step-limited run mode, a comparison script.
 - **Real historical reconstruction (plan step 4):** script not written. Needs answers to: (a) is `hist_obs` de-warmed the same way as the training ERA5 data, (b) single reconstruction vs. ensemble.
-- Reconcile this status doc's findings into `README_reproduction_guide.md` (job config, hist_obs_metadata.csv column order, measured numbers, resume-correctness behavior) once the sweep work settles down.
 
 ## 7. Notable bugs/errors and how they were diagnosed (chronological, not already in the setup guide)
 
@@ -110,14 +136,11 @@ Launched via `sbatch sweep_array.sh` (job array, 20 chunks, 4 concurrent). First
 | Every resumed training job silently redid the full 1000-epoch target                             | Epoch counter always reset to 1 on resume, ignoring `global_step`                                                                                                                                                        | Compute `start_epoch` from `global_step`; early-exit if already complete                                                              |
 | `[WARNING] 634 station(s) did not match an ERA5 grid cell` (all 634/634)                         | `hist_obs_metadata.csv` columns are `(id, lon, lat)`, not documented `(id, lat, lon)`                                                                                                                                    | Diagnosed via domain-bounds check: 0/634 valid as documented, 634/634 valid swapped. Fixed column order + added a hard validity check |
 | Sweep smoke-test job seemed to vanish from `squeue` almost instantly                             | Two distinct causes on two occasions: (1) genuinely failed — wrong working directory when submitting, so relative paths resolved wrong; (2) genuinely fine — the smoke test legitimately finishes in well under a minute | Always check the log, don't assume from `squeue` alone; `cd` into the code folder before `sbatch`                                     |
-| `sweep_array.sh` tasks stuck `PD` with reason `MaxMemoryRunMinsPerUser`                          | Per-task `--mem × --time` request too generous for 4 concurrent tasks under the `gratis` memory-time budget                                                                                                              | Not yet fixed — needs real per-batch timing to right-size the request (see §5)                                                        |
+| `sweep_array.sh` tasks stuck `PD` with reason `MaxMemoryRunMinsPerUser`                          | Per-task `--mem × --time` request (32G/24h) too generous for 4 concurrent tasks under the `gratis` memory-time budget                                                                                                     | Timed one real chunk, right-sized to `--mem=8G --time=10:00:00` (see §5)                                                              |
+| Even after that fix, only 2 (not 4) tasks ran concurrently, reason `JobArrayTaskLimit`           | `gratis` caps `rtx4090` at 2 concurrent per user (`sqos gpu`)                                                                                                                                                             | Changed `--array=0-19%4` to `%2` to match the real cap                                                                                |
 
 ---
 
-## Known gaps in `README_reproduction_guide.md` (setup guide), not yet reconciled
+## Status of `README_reproduction_guide.md` (setup guide)
 
-- Job config in §3/Step 7 still shows RTX4090/plain `gpu` partition — should reflect §4 of this doc.
-- Status table (§0) needs updating — training is done.
-- Step 7 notes say the epoch counter resets on resume — no longer true (§3.5 of this doc).
-- Step 4 data table says `hist_obs_metadata.csv` is `(id, lat, lon)` — wrong, it's `(id, lon, lat)` (§3.3 of this doc).
-- No measured training numbers or sweep results are in the guide yet.
+Reconciled with this doc as of 2026-10-02: job configs (§3), the `hist_obs_metadata.csv` column order, the resume-correctness behavior, and the full sweep results are all now reflected there too. Keep both in sync going forward — this file for the dated narrative/open questions, the guide for the step-by-step how-to.
